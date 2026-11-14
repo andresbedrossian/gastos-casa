@@ -96,6 +96,8 @@ p { margin: 6px 0; }
 .op-t { flex: 1; min-width: 0; }
 .op-t small { display: block; font-size: 13px; font-weight: 500; color: var(--mut); }
 .ops.dos .op { min-height: 60px; padding: 10px 12px; gap: 10px; font-size: 15.5px; line-height: 1.2; }
+/* "Otros" va siempre último, solo en su fila y centrado */
+.ops.dos .op.solo { grid-column: 1 / -1; justify-self: center; width: calc(50% - 5px); }
 .av {
   flex: 0 0 auto; width: 42px; height: 42px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
   font: 600 20px/1 var(--serif); color: #1b2030;
@@ -335,7 +337,7 @@ function pedirClave(motivo) {
 }
 var google = { script: { run: (function armar(ok, mal) {
   var o = { withSuccessHandler: function (h) { return armar(h, mal); }, withFailureHandler: function (h) { return armar(ok, h); } };
-  ['apiEstado', 'apiCargar', 'apiEditar', 'apiAnular', 'apiCerrar', 'apiPagarPrestamo'].forEach(function (fn) {
+  ['apiEstado', 'apiCargar', 'apiEditar', 'apiAnular', 'apiCerrar', 'apiPagarPrestamo', 'apiNuevoPrestamo', 'apiEditarPrestamo'].forEach(function (fn) {
     o[fn] = function (arg) {
       var clave = claveGuardada();
       if (!clave) { pedirClave(); if (mal) mal(new Error('Falta la clave de la app.')); return; }
@@ -365,6 +367,8 @@ var CUOTAS = [1, 2, 3, 6, 9, 12, 18, 24];
 var PAGO_PRESTAMO = 'Préstamo', CONCEPTO_PRESTAMO = 'Préstamos';
 // wp: el pago de préstamo que se está por cargar
 var wp = pagoNuevo();
+// wl: el préstamo nuevo que se está por anotar. tcDia: dólar BNA ya consultado, por día
+var wl = prestamoNuevo(), tcDia = {};
 // wn: el gasto nuevo que se está cargando. we: el gasto que se está editando (si hay)
 var wn = asistente(), we = null, enviado = null;
 var mesSel = null, perSel = 'mes', abiertoHist = null, alConfirmar = null, relojAviso = null;
@@ -417,6 +421,7 @@ var ICONOS = [
 
 function nuevo() { return { pago: '', importe: '', concepto: '', detalle: '', mes: '', fecha: '', cuotas: 1 }; }
 function pagoNuevo() { return { pago: '', dolares: '', tc: '', fecha: '', mes: '' }; }
+function prestamoNuevo() { return { abierto: false, quien: '', moneda: 'Dólares', monto: '', tc: '', tcMano: false, fecha: '', estado: '', fila: 0, antes: 0 }; }
 function hayPrestamos() { return !!(E && E.prestamos && E.prestamos.hay); }
 function asistente() { return { g: nuevo(), paso: 'pago', volver: false, id: '', orig: null }; }
 function W() { return vista === 'editar' && we ? we : wn; }
@@ -426,17 +431,51 @@ function esc(s) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
   });
 }
-function pesos(n) { return '$' + Math.round(Number(n) || 0).toLocaleString('en-US'); }
+// Números: coma en los miles y punto en los decimales. Los centavos se muestran solo si hay
+function cent(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+function pesos(n) { n = cent(n); return '$' + n.toLocaleString('en-US', { minimumFractionDigits: n % 1 ? 2 : 0, maximumFractionDigits: 2 }); }
 function usd(n) { return 'usd ' + (Math.round((Number(n) || 0) * 100) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
 function cambio(n) { return (Math.round((Number(n) || 0) * 100) / 100).toLocaleString('en-US', { maximumFractionDigits: 2 }); }
-// Lee un número escrito con punto o con coma. El último punto o coma es el decimal, salvo que le sigan justo tres cifras (ahí separa miles)
+// Lee un número que viene de afuera (pegado), esté escrito como esté: "1.234,56", "1,234.56", "$ 46.684,24", "1.900.000".
+// Con punto y coma, el último es el decimal. Con uno solo, es el decimal salvo que separe miles (justo tres cifras atrás y hasta tres adelante).
+// Con varios iguales, separan miles.
 function numero(t) {
   t = String(t === undefined || t === null ? '' : t).replace(/[^0-9.,]/g, '');
-  var p = Math.max(t.lastIndexOf('.'), t.lastIndexOf(','));
-  if (p >= 0 && t.length - p - 1 !== 3) return Number(t.slice(0, p).replace(/[.,]/g, '') + '.' + t.slice(p + 1)) || 0;
-  return Number(t.replace(/[.,]/g, '')) || 0;
+  var np = t.split('.').length - 1, nc = t.split(',').length - 1, p = -1;
+  if (np && nc) p = Math.max(t.lastIndexOf('.'), t.lastIndexOf(','));
+  else if (np + nc === 1) {
+    var q = t.search(/[.,]/);
+    if (t.length - q - 1 !== 3 || q === 0 || q > 3) p = q;
+  }
+  return cent(p < 0 ? t.replace(/[.,]/g, '') : t.slice(0, p).replace(/[.,]/g, '') + '.' + t.slice(p + 1).replace(/[.,]/g, ''));
 }
-function miles(digitos) { return digitos === '' || digitos === undefined ? '' : Number(digitos).toLocaleString('en-US'); }
+// Un importe como texto simple, sin separadores de miles: 1234.5 -> "1234.5" (vacío si es cero)
+function canon(n) { n = cent(n); return n > 0 ? String(n) : ''; }
+// Lo que se va tecleando en un campo de importe. El punto es el decimal; la coma recién tecleada también
+// (el teclado del iPhone trae coma), y las comas de los miles las pone la app. Hasta dos decimales.
+function escrito(v) {
+  v = String(v).replace(/[^0-9.,]/g, '');
+  if (v.indexOf('.') < 0 && /,$/.test(v)) v = v.slice(0, -1) + '.';
+  var p = v.indexOf('.');
+  var e = (p < 0 ? v : v.slice(0, p)).replace(/\D/g, '').replace(/^0+/, '').slice(0, 10);
+  return p < 0 ? e : (e || '0') + '.' + v.slice(p + 1).replace(/\D/g, '').slice(0, 2);
+}
+// Muestra un importe que se está escribiendo ("1234.5") con coma en los miles: "1,234.5"
+function miles(c) {
+  if (c === '' || c === undefined || c === null) return '';
+  c = String(c);
+  var p = c.indexOf('.');
+  return Number(p < 0 ? c : c.slice(0, p)).toLocaleString('en-US') + (p < 0 ? '' : c.slice(p));
+}
+// Valor de cada cuota (las cuotas se parten al centavo; lo que sobra va a la primera)
+function cuotaDe(importe, n) { return Math.floor(Math.round(Number(importe) * 100) / n) / 100; }
+// Conceptos en orden alfabético, con "Otros" siempre al final
+function esOtros(n) { return /^otros$/i.test(String(n).trim()); }
+function conceptosOrdenados() {
+  var lista = E.conceptos.filter(function (n) { return !esOtros(n); });
+  try { lista.sort(function (a, b) { return a.localeCompare(b, 'es', { sensitivity: 'base' }); }); } catch (e) { lista.sort(); }
+  return lista.concat(E.conceptos.filter(esOtros));
+}
 function fecha(ms) {
   if (!ms) return '';
   try {
@@ -531,16 +570,19 @@ function calc(mes, ingresos) {
     con[x.concepto] = (con[x.concepto] || 0) + x.importe;
     total += x.importe;
   });
+  // Las sumas se redondean al centavo (sumar decimales deja restos)
+  total = cent(total); prestado = cent(prestado); pago = pago.map(cent);
+  Object.keys(con).forEach(function (k) { con[k] = cent(con[k]); });
   ingresos.forEach(function (x) { suma += x; });
   var pct = ingresos.map(function (x) { return suma > 0 ? x / suma : 0; });
   // Lo pagado con un préstamo no se reparte ahora: se reparte cuando se devuelve
-  var corr = pct.map(function (p) { return p * (total - prestado); });
-  var saldo = pago.map(function (p, i) { return p - corr[i]; });
+  var corr = pct.map(function (p) { return cent(p * (total - prestado)); });
+  var saldo = pago.map(function (p, i) { return cent(p - corr[i]); });
   return { gastos: gs, pago: pago, con: con, total: total, prestado: prestado, pct: pct, corr: corr, saldo: saldo, hayIng: suma > 0 };
 }
 function resultado(saldo) {
   if (E.integrantes.length !== 2) return '';
-  var s = Math.round(saldo[0]);
+  var s = cent(saldo[0]);
   if (s > 0) return E.integrantes[1] + ' le transfiere a ' + E.integrantes[0] + ' ' + pesos(s);
   if (s < 0) return E.integrantes[0] + ' le transfiere a ' + E.integrantes[1] + ' ' + pesos(-s);
   return 'Están a mano';
@@ -606,8 +648,8 @@ function pintarCola() {
 }
 function mesDe(x) { return x.mes || (E && !E.parcial ? E.actual : ''); }
 
-function opcion(a, v, sel, adorno, nota) {
-  return '<button class="op' + (sel ? ' sel' : '') + '" data-a="' + a + '" data-v="' + esc(v) + '">' + (adorno || '') +
+function opcion(a, v, sel, adorno, nota, clase) {
+  return '<button class="op' + (sel ? ' sel' : '') + (clase ? ' ' + clase : '') + '" data-a="' + a + '" data-v="' + esc(v) + '">' + (adorno || '') +
     '<span class="op-t">' + esc(v) + (nota ? '<small>' + nota + '</small>' : '') + '</span></button>';
 }
 function linea(p, nombre, valor) {
@@ -655,12 +697,13 @@ function pintarAsistente(c, w) {
   if (paso === 'pago') {
     t += '<h1>¿Quién pagó?</h1><div class="ops">';
     E.integrantes.forEach(function (n) { t += opcion('pago', n, g.pago === n, avatar(n)); });
-    if (ed && w.orig.pago === PAGO_PRESTAMO) t += opcion('pago', PAGO_PRESTAMO, g.pago === PAGO_PRESTAMO, avatar(PAGO_PRESTAMO), 'No entra en el reparto del mes');
+    // "Préstamo" se ofrece solo mientras haya plata prestada sin devolver (o si el gasto que se edita ya estaba así)
+    if ((ed && w.orig.pago === PAGO_PRESTAMO) || (E.prestamos && E.prestamos.deuda > 0.005)) t += opcion('pago', PAGO_PRESTAMO, g.pago === PAGO_PRESTAMO, avatar(PAGO_PRESTAMO), 'No entra en el reparto del mes');
     t += '</div>';
   } else if (paso === 'importe') {
     t += '<h1>¿Cuánto?</h1><div class="monto"><span>$</span>' +
-      '<input id="in-importe" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="' + miles(g.importe) + '"></div>' +
-      '<div class="eco" id="eco-importe">Solo el número, sin centavos</div>';
+      '<input id="in-importe" data-num inputmode="decimal" autocomplete="off" value="' + miles(g.importe) + '"></div>' +
+      '<div class="eco" id="eco-importe">Centavos con punto o coma</div>';
     // Las cuotas se eligen acá mismo (por defecto, contado). Al editar no: cada cuota ya es un gasto aparte
     if (!ed) {
       t += '<div class="cuo"><span class="cuo-t">Cuotas</span><div class="chips" id="cuo">';
@@ -674,7 +717,7 @@ function pintarAsistente(c, w) {
     t += '<button class="btn prim" data-a="sig" id="b-sig">' + (w.volver ? 'Listo' : 'Siguiente') + '</button>';
   } else if (paso === 'concepto') {
     t += '<h1>¿En qué?</h1><div class="ops dos">';
-    E.conceptos.forEach(function (n) { t += opcion('concepto', n, g.concepto === n, icono(n)); });
+    conceptosOrdenados().forEach(function (n) { t += opcion('concepto', n, g.concepto === n, icono(n), '', esOtros(n) ? 'solo' : ''); });
     t += '</div>';
   } else if (paso === 'detalle') {
     t += '<h1>¿Algún detalle?</h1><input id="in-detalle" class="texto" maxlength="200" autocomplete="off" placeholder="Opcional" value="' + esc(g.detalle) + '">' +
@@ -683,7 +726,7 @@ function pintarAsistente(c, w) {
     t += '<h1>¿En cuántas cuotas?</h1><div class="ops dos">';
     CUOTAS.forEach(function (n) {
       t += '<button class="op' + (g.cuotas === n ? ' sel' : '') + '" data-a="cuotas" data-v="' + n + '"><span class="op-t">' + (n === 1 ? 'Contado' : n + ' cuotas') +
-        (n > 1 && Number(g.importe) >= n ? '<small>de ' + pesos(Math.floor(Number(g.importe) / n)) + '</small>' : '') + '</span></button>';
+        (n > 1 && Number(g.importe) >= n ? '<small>de ' + pesos(cuotaDe(g.importe, n)) + '</small>' : '') + '</span></button>';
     });
     t += '</div><div class="pie"><input id="in-cuotas" class="texto" data-nofoco="1" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="Otra cantidad">' +
       '<button class="btn prim atras" data-a="cuotas-otra">Listo</button></div>';
@@ -701,7 +744,7 @@ function pintarAsistente(c, w) {
       linea('detalle', 'Detalle', g.detalle || 'Sin detalle') +
       '<label class="fila tocable"><span class="mut">Día</span><span class="der"><input type="date" id="in-fecha" class="dia" value="' + esc(g.fecha || hoy()) + '">' +
       '<span class="lapiz">Cambiar</span></span></label>' +
-      (ed ? '' : linea('cuotas', 'Cuotas', g.cuotas > 1 ? g.cuotas + ' de ' + pesos(Math.floor(Number(g.importe) / g.cuotas)) : 'Contado')) +
+      (ed ? '' : linea('cuotas', 'Cuotas', g.cuotas > 1 ? g.cuotas + ' de ' + pesos(cuotaDe(g.importe, g.cuotas)) : 'Contado')) +
       linea('mes', g.cuotas > 1 ? 'Primera cuota' : 'Mes', g.mes || E.actual) + '</div>';
     if (!ed && g.cuotas > 1) t += '<p class="mut chico centro">Se reparte en ' + g.cuotas + ' meses, de ' + esc(g.mes || E.actual) + ' a ' +
       esc(etiquetaDeClave(sumaMes(claveDe(g.mes || E.actual), g.cuotas - 1))) + '.</p>';
@@ -739,7 +782,7 @@ function ecoCuotas(centrar) {
   }
   otra.value = sel ? '' : String(n);
   otra.className = 'chip' + (sel ? '' : ' sel');
-  eco.textContent = n > 1 ? n + ' cuotas' + (imp >= n ? ' de ' + pesos(Math.floor(imp / n)) : '') : 'Solo el número, sin centavos';
+  eco.textContent = n > 1 ? n + ' cuotas' + (imp >= n ? ' de ' + pesos(cuotaDe(imp, n)) : '') : 'Centavos con punto o coma';
   if (centrar) { var el = sel || otra; caja.scrollLeft = Math.max(0, el.offsetLeft - (caja.clientWidth - el.offsetWidth) / 2); }
 }
 
@@ -794,7 +837,7 @@ function pintarResumen() {
   t += '<div class="card"><h2>Reparto</h2><p class="mut chico">' +
     (cerrable ? 'Cargá lo que cobró cada uno para cerrar el mes.' : 'Con lo que cobró cada uno se calcula cuánto le toca. Es una estimación hasta que se cierre el mes.') + '</p>';
   E.integrantes.forEach(function (n) {
-    t += '<label class="campo"><span>' + punto(n) + 'Cobró ' + esc(n) + '</span><input inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="$" data-ing="' + esc(n) + '" value="' + miles(o[n]) + '"></label>';
+    t += '<label class="campo"><span>' + punto(n) + 'Cobró ' + esc(n) + '</span><input data-num inputmode="decimal" autocomplete="off" placeholder="$" data-ing="' + esc(n) + '" value="' + miles(o[n]) + '"></label>';
   });
   if (c.prestado > 0) t += '<p class="mut chico">Lo pagado con préstamo (' + pesos(c.prestado) + ') no entra en este reparto: se reparte a medida que se devuelve.</p>';
   t += '<div id="reparto"></div></div>';
@@ -921,7 +964,7 @@ function mesPago() {
 function ecoPago() {
   var eco = $('pre-eco');
   if (!eco) return;
-  var u = numero(wp.dolares), tc = numero(wp.tc), cs = document.querySelectorAll('[data-a="pre-quien"]');
+  var u = Number(wp.dolares) || 0, tc = Number(wp.tc) || 0, cs = document.querySelectorAll('[data-a="pre-quien"]');
   for (var i = 0; i < cs.length; i++) {
     var on = cs[i].getAttribute('data-v') === wp.pago;
     cs[i].className = 'chip' + (on ? ' sel' : '');
@@ -930,6 +973,55 @@ function ecoPago() {
   $('pre-mes').value = mesPago();
   eco.textContent = u > 0 && tc > 0 ? usd(u) + ' a ' + cambio(tc) + ' son ' + pesos(u * tc) + '. Entra en el reparto de ' + mesPago() + '.'
     : 'El pago entra, por su valor en pesos, en el reparto del mes elegido.';
+}
+
+// Préstamo nuevo: marca la moneda, muestra el tipo de cambio solo si es en pesos y dice cómo queda en dólares (sin volver a dibujar la pantalla)
+function ecoNuevo() {
+  var eco = $('pn-eco');
+  if (!eco) return;
+  var enPesos = wl.moneda === 'Pesos', cs = document.querySelectorAll('[data-a="pn-mon"]'), tcEl = $('pn-tc');
+  for (var i = 0; i < cs.length; i++) {
+    var on = cs[i].getAttribute('data-v') === wl.moneda;
+    cs[i].className = 'chip' + (on ? ' sel' : '');
+    cs[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+  $('pn-tc-campo').hidden = !enPesos;
+  $('pn-monto').placeholder = enPesos ? '$' : 'usd';
+  if (document.activeElement !== tcEl) tcEl.value = miles(wl.tc);
+  var m = Number(wl.monto) || 0, tc = Number(wl.tc) || 0, f = wl.fecha || hoy(), t;
+  if (wl.fila) t = m > 0 && Math.abs(m - wl.antes) > 0.005 ? 'Pasa de ' + usd(wl.antes) + ' a ' + usd(m) + '.' : '';
+  else if (!enPesos) t = m > 0 ? 'Se suman ' + usd(m) + ' a lo que falta devolver.' : 'Se suma, en dólares, a lo que falta devolver.';
+  else {
+    t = wl.tcMano ? '' : wl.estado === 'buscando' ? 'Buscando el dólar BNA del ' + dia(f) + '…'
+      : wl.estado === 'falla' ? 'No pude traer el dólar BNA del ' + dia(f) + ': ponelo a mano.'
+      : wl.estado === 'ok' ? 'Dólar BNA (venta) del ' + dia(f) + '.' : '';
+    t = (m > 0 && tc > 0 ? pesos(m) + ' a ' + cambio(tc) + ' son ' + usd(m / tc) + ', que se suman a lo que falta devolver. ' : '') +
+      (t || (m > 0 && tc > 0 ? '' : 'Los pesos se pasan a dólares con el dólar BNA (venta) de ese día.'));
+  }
+  eco.textContent = t;
+}
+// Trae el dólar BNA (venta) del día del préstamo. Si se escribió un tipo de cambio a mano, no lo pisa
+function buscarTC() {
+  var f = wl.fecha || hoy();
+  var vigente = function () { return wl.abierto && wl.moneda === 'Pesos' && !wl.tcMano && (wl.fecha || hoy()) === f; };
+  if (!vigente()) return;
+  if (tcDia[f]) { wl.tc = String(tcDia[f]); wl.estado = 'ok'; ecoNuevo(); return; }
+  wl.tc = ''; wl.estado = 'buscando'; ecoNuevo();
+  var mal = function () { if (vigente()) { wl.estado = 'falla'; ecoNuevo(); } };
+  var pedir = function (url, sigue) {
+    try {
+      fetch(url).then(function (res) { if (!res.ok) throw new Error('sin dato'); return res.json(); })
+        .then(function (j) {
+          var v = cent(j && j.venta);
+          if (!(v > 0)) throw new Error('sin dato');
+          tcDia[f] = v;
+          if (vigente()) { wl.tc = String(v); wl.estado = 'ok'; ecoNuevo(); }
+        }).catch(sigue);
+    } catch (e) { sigue(); }
+  };
+  pedir('https://api.argentinadatos.com/v1/cotizaciones/dolares/oficial/' + f.replace(/-/g, '/'), function () {
+    if (f === hoy()) pedir('https://dolarapi.com/v1/dolares/oficial', mal); else mal();
+  });
 }
 
 function pintarPrestamos() {
@@ -953,15 +1045,32 @@ function pintarPrestamos() {
       '<div class="campo"><span>Pagó</span><div class="chips">';
     E.integrantes.forEach(function (n) { t += '<button type="button" class="chip" data-a="pre-quien" data-v="' + esc(n) + '">' + esc(n) + '</button>'; });
     t += '</div></div>' +
-      '<label class="campo"><span>Dólares</span><input id="pre-usd" inputmode="decimal" autocomplete="off" placeholder="usd" value="' + esc(wp.dolares) + '"></label>' +
-      '<label class="campo"><span>Tipo de cambio</span><input id="pre-tc" inputmode="decimal" autocomplete="off" placeholder="$ por dólar" value="' + esc(wp.tc) + '"></label>' +
+      '<label class="campo"><span>Dólares</span><input id="pre-usd" data-num inputmode="decimal" autocomplete="off" placeholder="usd" value="' + miles(wp.dolares) + '"></label>' +
+      '<label class="campo"><span>Tipo de cambio</span><input id="pre-tc" data-num inputmode="decimal" autocomplete="off" placeholder="$ por dólar" value="' + miles(wp.tc) + '"></label>' +
       '<label class="campo"><span>Día</span><input type="date" id="pre-fecha" value="' + esc(wp.fecha || hoy()) + '"></label>' +
       '<label class="campo"><span>Mes del reparto</span><select id="pre-mes">';
     E.abiertos.concat([E.siguiente]).forEach(function (m) { t += '<option value="' + esc(m) + '">' + esc(m) + '</option>'; });
     t += '</select></label><p class="mut chico" id="pre-eco"></p>' +
       '<button class="btn prim" data-a="pre-pagar">Cargar pago</button></div>';
   } else {
-    t += '<div class="card"><p class="mut">Ya está todo devuelto.</p></div>';
+    t += '<div class="card"><p class="mut">' + (P.recibido > 0 ? 'Ya está todo devuelto.' : 'No hay préstamos anotados.') + '</p></div>';
+  }
+
+  if (!wl.abierto) {
+    t += '<button class="btn" data-a="pn-abrir">Anotar un préstamo nuevo</button>';
+  } else {
+    t += '<div class="card" id="pn-card"><h2>' + (wl.fila ? 'Corregir préstamo' : 'Préstamo nuevo') + '</h2>' +
+      '<label class="campo"><span>' + (wl.fila ? 'Detalle' : 'Quién prestó') + '</span><input id="pn-quien" maxlength="' + (wl.fila ? 120 : 40) + '" autocomplete="off" placeholder="' + (wl.fila ? 'Detalle' : 'Nombre') + '" value="' + esc(wl.quien) + '"></label>' +
+      '<div class="campo"' + (wl.fila ? ' hidden' : '') + '><span>Moneda</span><div class="chips">';
+    ['Dólares', 'Pesos'].forEach(function (n) { t += '<button type="button" class="chip" data-a="pn-mon" data-v="' + n + '">' + n + '</button>'; });
+    t += '</div></div>' +
+      '<label class="campo"><span>' + (wl.fila ? 'Dólares' : 'Monto') + '</span><input id="pn-monto" data-num inputmode="decimal" autocomplete="off" value="' + miles(wl.monto) + '"></label>' +
+      '<label class="campo" id="pn-tc-campo"><span>Dólar BNA</span><input id="pn-tc" data-num inputmode="decimal" autocomplete="off" placeholder="$ por dólar" value="' + miles(wl.tc) + '"></label>' +
+      '<label class="campo"><span>Día</span><input type="date" id="pn-fecha" max="' + hoy() + '" value="' + esc(wl.fecha || hoy()) + '"></label>' +
+      '<p class="mut chico" id="pn-eco"></p>' +
+      '<div class="pie"><button class="btn atras" data-a="pn-cerrar">Cancelar</button>' +
+      '<button class="btn prim" data-a="pn-guardar">' + (wl.fila ? 'Guardar cambios' : 'Anotar préstamo') + '</button></div>' +
+      (wl.fila ? '<button class="btn peligro" data-a="pn-borrar">Borrar préstamo</button>' : '') + '</div>';
   }
 
   t += '<div class="card"><h2>Pagos</h2>';
@@ -984,12 +1093,14 @@ function pintarPrestamos() {
     t += '<div class="card"><h2>Préstamos y depósitos</h2>';
     P.declarados.forEach(function (x) {
       t += '<div class="fila"><span>' + esc(x.tipo) + (x.fecha ? ' <span class="mut">' + dia(x.fecha) + '/' + x.fecha.slice(2, 4) + '</span>' : '') +
-        (x.detalle ? '<br><span class="mut chico">' + esc(x.detalle) + '</span>' : '') + '</span><b class="der">' + usd(x.dolares) + '</b></div>';
+        (x.detalle ? '<br><span class="mut chico">' + esc(x.detalle) + '</span>' : '') + '</span><span class="der"><b>' + usd(x.dolares) + '</b>' +
+        (x.tipo === 'Préstamo recibido' && x.fila ? '<br><button class="enlace" data-a="pn-editar" data-v="' + x.fila + '">Editar</button>' : '') + '</span></div>';
     });
-    t += '<p class="mut chico">Los préstamos y depósitos se anotan en la planilla (pestaña Préstamos y depósitos). Los pagos se cargan acá.</p></div>';
+    t += '<p class="mut chico">Los préstamos se corrigen o se borran con Editar. Los depósitos se anotan en la planilla (pestaña Préstamos y depósitos).</p></div>';
   }
   $('v-prestamos').innerHTML = t;
   ecoPago();
+  ecoNuevo();
 }
 
 // ---------- Estadísticas ----------
@@ -1177,7 +1288,7 @@ function exportar() {
   if (c.prestado > 0) per.push([PAGO_PRESTAMO, c.prestado, c.prestado / c.total]);
   var centro = ' applyAlignment="1"><alignment horizontal="center"/></xf>';
   var estilos = XML + '<styleSheet xmlns="' + NS + 'spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="dd/mm/yyyy"/>' +
-    '<numFmt numFmtId="165" formatCode="&quot;$&quot;#,##0"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>' +
+    '<numFmt numFmtId="165" formatCode="&quot;$&quot;#,##0.00"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>' +
     '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill>' +
     '<fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFECEEF6"/><bgColor indexed="64"/></patternFill></fill></fills>' +
     '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
@@ -1295,7 +1406,7 @@ function accion(a, v) {
   else if (a === 'mesres') { mesSel = v; pintar(); window.scrollTo(0, 0); }
   else if (a === 'pre-quien') { wp.pago = v; ecoPago(); }
   else if (a === 'pre-pagar') {
-    var u = numero(wp.dolares), tc = numero(wp.tc), mp = mesPago();
+    var u = Number(wp.dolares) || 0, tc = Number(wp.tc) || 0, mp = mesPago();
     if (!wp.pago) { aviso('Elegí quién pagó.'); return; }
     if (!(u > 0)) { aviso('Poné cuántos dólares se pagaron.'); return; }
     if (u > E.prestamos.deuda + 0.005) { aviso('Es más de lo que falta devolver (' + usd(E.prestamos.deuda) + ').'); return; }
@@ -1303,6 +1414,40 @@ function accion(a, v) {
     confirmar('¿Cargar este pago?', wp.pago + ' · ' + usd(u) + ' a ' + cambio(tc) + ' (' + pesos(u * tc) + '). Entra en el reparto de ' + mp + '.', 'Cargar pago', function () {
       llamar('apiPagarPrestamo', { pago: wp.pago, dolares: u, tc: tc, fecha: wp.fecha || hoy(), mes: mp }, function () {
         wp = pagoNuevo(); aviso('Pago cargado.'); pintar(); window.scrollTo(0, 0);
+      });
+    });
+  }
+  else if (a === 'pn-abrir') { wl.abierto = true; pintar(); }
+  else if (a === 'pn-cerrar') { wl = prestamoNuevo(); pintar(); }
+  else if (a === 'pn-mon') { wl.moneda = v; ecoNuevo(); buscarTC(); }
+  else if (a === 'pn-editar') {
+    var pe = E.prestamos.declarados.filter(function (z) { return String(z.fila) === String(v); })[0];
+    if (!pe) return;
+    wl = prestamoNuevo();
+    wl.abierto = true; wl.fila = pe.fila; wl.antes = pe.dolares; wl.quien = pe.detalle; wl.monto = String(pe.dolares); wl.fecha = pe.fecha;
+    pintar();
+    try { $('pn-card').scrollIntoView({ block: 'center' }); } catch (e) {}
+  }
+  else if (a === 'pn-borrar') {
+    confirmar('¿Borrar este préstamo?', usd(wl.antes) + (wl.quien ? ' · ' + wl.quien : '') + '. Deja de contar en lo que falta devolver.', 'Borrar préstamo', function () {
+      llamar('apiEditarPrestamo', { fila: wl.fila, antes: wl.antes, borrar: true }, function () { wl = prestamoNuevo(); aviso('Préstamo borrado.'); pintar(); window.scrollTo(0, 0); });
+    }, true);
+  }
+  else if (a === 'pn-guardar' && wl.fila) {
+    var me = Number(wl.monto) || 0, fe = wl.fecha || hoy();
+    if (!(me > 0)) { aviso('Poné los dólares.'); return; }
+    confirmar('¿Guardar los cambios?', usd(me) + ' · ' + dia(fe) + (wl.quien.trim() ? ' · ' + wl.quien.trim() : '') + '.', 'Guardar cambios', function () {
+      llamar('apiEditarPrestamo', { fila: wl.fila, antes: wl.antes, dolares: me, fecha: fe, detalle: wl.quien.trim() }, function () { wl = prestamoNuevo(); aviso('Préstamo corregido.'); pintar(); window.scrollTo(0, 0); });
+    });
+  }
+  else if (a === 'pn-guardar') {
+    var qn = wl.quien.trim(), mo = Number(wl.monto) || 0, tcn = Number(wl.tc) || 0, enP = wl.moneda === 'Pesos', fp = wl.fecha || hoy();
+    if (!qn) { aviso('Poné quién prestó.'); return; }
+    if (!(mo > 0)) { aviso('Poné el monto.'); return; }
+    if (enP && !(tcn > 0)) { aviso('Poné el tipo de cambio.'); return; }
+    confirmar('¿Anotar este préstamo?', qn + ' · ' + (enP ? pesos(mo) + ' a ' + cambio(tcn) + ' = ' + usd(mo / tcn) : usd(mo)) + ' · ' + dia(fp) + '. Se suma a lo que falta devolver.', 'Anotar préstamo', function () {
+      llamar('apiNuevoPrestamo', { quien: qn, moneda: wl.moneda, monto: mo, tc: enP ? tcn : 0, fecha: fp }, function () {
+        wl = prestamoNuevo(); aviso('Préstamo anotado.'); pintar(); window.scrollTo(0, 0);
       });
     });
   }
@@ -1356,29 +1501,57 @@ document.addEventListener('click', function (ev) {
 });
 // Tocar una cantidad de cuotas no le saca el foco (ni el teclado) al importe
 document.addEventListener('mousedown', function (ev) {
-  if (ev.target.closest && ev.target.closest('[data-a="cuo"], [data-a="pre-quien"]')) ev.preventDefault();
+  if (ev.target.closest && ev.target.closest('[data-a="cuo"], [data-a="pre-quien"], [data-a="pn-mon"]')) ev.preventDefault();
 });
-document.addEventListener('input', function (ev) {
-  var el = ev.target;
-  if (el.id === 'in-importe') {
-    W().g.importe = el.value.replace(/\D/g, '').replace(/^0+/, '').slice(0, 10);
-    el.value = miles(W().g.importe);
-    ecoCuotas();
-  } else if (el.id === 'pre-usd' || el.id === 'pre-tc') {
-    wp[el.id === 'pre-usd' ? 'dolares' : 'tc'] = el.value.replace(/[^0-9.,]/g, '').slice(0, 14);
-    if (el.value !== wp[el.id === 'pre-usd' ? 'dolares' : 'tc']) el.value = wp[el.id === 'pre-usd' ? 'dolares' : 'tc'];
-    ecoPago();
-  } else if (el.id === 'in-detalle') {
-    W().g.detalle = el.value;
-    $('b-sig').textContent = textoSig(W());
-  } else if (el.getAttribute('data-ing')) {
-    var d = el.value.replace(/\D/g, '').slice(0, 11);
+// Dice si el texto nuevo sale del anterior con una tecla: un carácter más, o un tramo borrado
+function tecleo(a, b) {
+  var i = 0;
+  while (i < a.length && i < b.length && a.charAt(i) === b.charAt(i)) i++;
+  var cola = b.length > a.length ? a.slice(i) : a.slice(i + a.length - b.length);
+  return b.length === a.length + 1 ? b.slice(i + 1) === cola : b.length < a.length && b.slice(i) === cola;
+}
+// Guarda el importe de un campo numérico (c es el texto simple, "1234.5") donde corresponda
+function anotar(el, c) {
+  var quien = el.getAttribute('data-ing');
+  if (el.id === 'in-importe') { W().g.importe = c; ecoCuotas(); }
+  else if (el.id === 'pre-usd' || el.id === 'pre-tc') { wp[el.id === 'pre-usd' ? 'dolares' : 'tc'] = c; ecoPago(); }
+  else if (el.id === 'pn-monto') { wl.monto = c; ecoNuevo(); }
+  else if (el.id === 'pn-tc') { wl.tc = c; wl.tcMano = c !== ''; if (!c) wl.estado = ''; ecoNuevo(); }
+  else if (quien) {
     ing[mesSel] = ing[mesSel] || {};
-    ing[mesSel][el.getAttribute('data-ing')] = d;
-    el.value = miles(d);
+    ing[mesSel][quien] = c;
     guardarIng();
     pintarReparto();
   }
+}
+document.addEventListener('input', function (ev) {
+  var el = ev.target;
+  if (el.hasAttribute('data-num')) {
+    // Si el texto entró de golpe (pegado, dictado, autocompletado) se lee el número entero, venga como venga; si no, es tecleo
+    var antes = el.getAttribute('data-antes'), deGolpe = /^insertFrom|^insertReplacementText/.test(ev.inputType || '') ||
+      !tecleo(antes === null ? el.defaultValue : antes, el.value);
+    var c = deGolpe ? canon(numero(el.value)) : escrito(el.value);
+    el.value = miles(c);
+    el.setAttribute('data-antes', el.value);
+    anotar(el, c);
+  } else if (el.id === 'in-detalle') {
+    W().g.detalle = el.value;
+    $('b-sig').textContent = textoSig(W());
+  } else if (el.id === 'pn-quien') {
+    wl.quien = el.value;
+  }
+});
+// Pegar un número del portapapeles: se lee como venga escrito (1.234,56 o 1,234.56) y reemplaza lo que había en el campo
+document.addEventListener('paste', function (ev) {
+  var el = ev.target, t = '';
+  if (!el || !el.hasAttribute || !el.hasAttribute('data-num')) return;
+  try { t = (ev.clipboardData || window.clipboardData).getData('text') || ''; } catch (e) { return; }
+  ev.preventDefault();
+  var c = canon(numero(t));
+  if (!c) { aviso('Lo que copiaste no es un número.'); return; }
+  el.value = miles(c);
+  el.setAttribute('data-antes', el.value);
+  anotar(el, c);
 });
 document.addEventListener('change', function (ev) {
   var el = ev.target, w = W();
@@ -1386,6 +1559,8 @@ document.addEventListener('change', function (ev) {
   // Pago de préstamo: al cambiar el día, el mes lo acompaña; el mes también se puede elegir a mano
   if (el.id === 'pre-fecha') { if (el.value.length === 10) { wp.fecha = el.value; wp.mes = ''; } else el.value = wp.fecha || hoy(); ecoPago(); return; }
   if (el.id === 'pre-mes') { wp.mes = el.value; ecoPago(); return; }
+  // Préstamo nuevo: al cambiar el día se busca el dólar BNA de ese día
+  if (el.id === 'pn-fecha') { if (el.value.length === 10 && el.value <= hoy()) wl.fecha = el.value; else el.value = wl.fecha || hoy(); ecoNuevo(); buscarTC(); return; }
   if (el.id !== 'in-fecha') return;
   if (el.value.length !== 10) { el.value = w.g.fecha || hoy(); return; }
   w.g.fecha = el.value;
